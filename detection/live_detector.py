@@ -1,4 +1,5 @@
-
+from detection.tcp_stream_reassembler import TCPStreamReassembler
+from detection.http_slowloris_detector import HTTPSlowlorisDetector
 from scapy.all import sniff, IP, TCP, UDP
 from pathlib import Path
 from datetime import datetime
@@ -10,7 +11,7 @@ from firewall.firewall_controller import execute_action
 from detection.attack_analyzer import analyze_attack
 from detection.risk_engine import calculate_risk
 from firewall.decision_engine import make_firewall_decision
-
+from detection.tcp_connection_tracker import TCPConnectionTracker
 
 # ==========================================
 # CONFIGURATION
@@ -18,18 +19,51 @@ from firewall.decision_engine import make_firewall_decision
 
 INTERFACE = os.getenv(
     "FIREWALL_INTERFACE",
-    "enp0s3"
+     "wlo1"
 )
-
+LOCAL_IP = os.getenv(
+    "FIREWALL_LOCAL_IP",
+    "192.168.1.135"
+)
 WINDOW_SECONDS = 5
 
+# Track TCP connections across detection windows.
+tcp_tracker = TCPConnectionTracker(
+    connection_timeout=300,
+    long_lived_threshold=30
+)
+# TCP stream reconstruction
+tcp_reassembler = TCPStreamReassembler(
+    connection_timeout=60,
+    maximum_buffer=262144
+)
+
+# HTTP-aware Slowloris detection
+http_detector = HTTPSlowlorisDetector(
+    header_timeout=10,
+    minimum_incomplete_requests=3,
+    connection_timeout=60
+)
+
+# Plaintext HTTP ports monitored initially
+# ==========================================
+# HTTP CONFIGURATION
+# ==========================================
+
+HTTP_PORTS = {80, 8080}
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+# ==========================================
+# FINAL EXPERIMENTAL MODEL
+# ==========================================
 
 MODEL_FILE = (
     PROJECT_ROOT /
     "models" /
     "trained" /
-    "isolation_forest.pkl"
+    "isolation_forest_experimental_20261031.pkl"
 )
 
 
@@ -45,7 +79,12 @@ FEATURES = [
     "icmp_count",
     "unique_source_ips",
     "unique_destination_ips",
-    "unique_destination_ports"
+    "unique_destination_ports",
+    "new_tcp_connections",
+    "active_tcp_connections",
+    "long_lived_tcp_connections",
+    "mean_connection_age_seconds",
+    "max_connection_age_seconds"
 ]
 
 
@@ -53,6 +92,9 @@ FEATURES = [
 # LOAD MODEL
 # ==========================================
 
+print("==========================================")
+print("       AI FIREWALL LIVE DETECTOR")
+print("==========================================\n")
 print("==========================================")
 print("       AI FIREWALL LIVE DETECTOR")
 print("==========================================\n")
@@ -77,87 +119,118 @@ def analyze_packets(packets):
 
     packet_count = len(packets)
 
-    total_bytes = sum(
-        len(packet)
-        for packet in packets
-    )
+    total_bytes = sum(len(packet) for packet in packets)
 
     tcp_count = 0
     udp_count = 0
+    outgoing_tcp_syn_count = 0
     icmp_count = 0
 
     tcp_syn_count = 0
     tcp_rst_count = 0
 
     source_ports = set()
-
+    outgoing_tcp_destination_ports = set()
     source_ips = set()
     destination_ips = set()
     destination_ports = set()
 
     for packet in packets:
 
+        tcp_tracker.process_packet(packet)
+
+        # HTTP-aware TCP stream processing
+        if packet.haslayer(IP) and packet.haslayer(TCP):
+
+            tcp = packet[TCP]
+
+            connection_id = (
+                packet[IP].src,
+                int(tcp.sport),
+                packet[IP].dst,
+                int(tcp.dport)
+            )
+
+            reverse_id = (
+                packet[IP].dst,
+                int(tcp.dport),
+                packet[IP].src,
+                int(tcp.sport)
+            )
+
+            stream_result = tcp_reassembler.process_packet(packet)
+
+            if int(tcp.dport) in HTTP_PORTS:
+
+                if tcp_reassembler.is_ambiguous(connection_id):
+
+                    http_detector.close_connection(connection_id)
+
+                elif stream_result is not None:
+
+                    stream_id, payload = stream_result
+
+                    if payload:
+
+                        http_detector.process_payload(
+                            stream_id[0],
+                            stream_id,
+                            payload
+                        )
+
+            # TCP FIN or RST
+            flags = int(tcp.flags)
+
+            if flags & 0x05:
+
+                http_detector.close_connection(connection_id)
+                http_detector.close_connection(reverse_id)
+
         if not packet.haslayer(IP):
             continue
 
         ip_layer = packet[IP]
 
-        source_ips.add(
-            ip_layer.src
-        )
-
-        destination_ips.add(
-            ip_layer.dst
-        )
-
-        # -----------------------------
-        # TCP
-        # -----------------------------
+        source_ips.add(ip_layer.src)
+        destination_ips.add(ip_layer.dst)
 
         if packet.haslayer(TCP):
 
             tcp_count += 1
 
-            destination_ports.add(
-                packet[TCP].dport
-            )
-
-            source_ports.add(
-                packet[TCP].sport
-            )
-
             flags = int(packet[TCP].flags)
 
-            if flags & 0x02:
+            destination_ports.add(packet[TCP].dport)
+
+            if ip_layer.src == LOCAL_IP and flags & 0x02:
+
+                outgoing_tcp_destination_ports.add(
+                    packet[TCP].dport
+                )
+
+            source_ports.add(packet[TCP].sport)
+
+            if (flags & 0x02) and not (flags & 0x10):
                 tcp_syn_count += 1
+
+            if flags & 0x02 and ip_layer.src == LOCAL_IP:
+                outgoing_tcp_syn_count += 1
 
             if flags & 0x04:
                 tcp_rst_count += 1
-
-        # -----------------------------
-        # UDP
-        # -----------------------------
 
         elif packet.haslayer(UDP):
 
             udp_count += 1
 
-            destination_ports.add(
-                packet[UDP].dport
-            )
-
-        # -----------------------------
-        # ICMP
-        # -----------------------------
+            destination_ports.add(packet[UDP].dport)
 
         elif ip_layer.proto == 1:
 
             icmp_count += 1
 
-
     return {
 
-        # ML features
         "packets_per_second":
             packet_count / WINDOW_SECONDS,
 
@@ -182,15 +255,22 @@ def analyze_packets(packets):
         "unique_destination_ports":
             len(destination_ports),
 
-        # Attack-analysis features
         "tcp_syn_count":
             tcp_syn_count,
+
+        "outgoing_tcp_syn_count":
+            outgoing_tcp_syn_count,
+
+        "outgoing_tcp_destination_ports":
+            len(outgoing_tcp_destination_ports),
 
         "tcp_rst_count":
             tcp_rst_count,
 
         "unique_source_ports":
-            len(source_ports)
+            len(source_ports),
+
+        **tcp_tracker.get_statistics()
     }
 
 
@@ -220,6 +300,7 @@ while True:
     features = analyze_packets(
         packets
     )
+
 
 
     # ======================================
@@ -253,6 +334,46 @@ while True:
 
     attack_result = analyze_attack(
         features
+    )
+
+
+
+    # ======================================
+    # HTTP-AWARE SLOWLORIS DETECTION
+    # ======================================
+
+    http_result = http_detector.get_statistics()
+
+    if http_result["alerts"]:
+
+        for alert in http_result["alerts"]:
+
+            attack_result["attack_type"] = "Possible HTTP Slowloris"
+
+            attack_result["risk_score"] = max(
+                attack_result["risk_score"],
+                40
+            )
+
+            reason = (
+                f"HTTP Slowloris detected from "
+                f"{alert['client_ip']}: "
+                f"{alert['incomplete_requests']} incomplete requests"
+            )
+
+            if reason not in attack_result["reasons"]:
+                attack_result["reasons"].append(reason)
+
+    print("\nHTTP DETECTION")
+
+    print(
+        "Incomplete HTTP requests:",
+        http_result["incomplete_http_requests"]
+    )
+
+    print(
+        "HTTP Slowloris alerts:",
+        len(http_result["alerts"])
     )
 
 

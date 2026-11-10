@@ -26,3 +26,27 @@ data/*
 # Allow documentation and small safe examples
 !logs/README.md
 !data/README.md
+
+# Exclude old feature extraction and monitoring workflows
+/monitoring/
+
+# Exclude obsolete detection scripts
+/detection/baseline_summary.py
+/detection/test_model.py
+/detection/train_isolation_forest.py
+/detection/train_candidate_model.py
+/detection/evaluate_model_v2.py
+/detection/evaluate_slow_http.py
+
+# Include only the current trained model
+/models/*
+!/models/trained/
+/models/trained/*
+!/models/trained/isolation_forest_experimental_20261031.pkl
+
+# Include only the current model training dataset
+/data/*
+!/data/normal_baseline_experimental_20261031.csv
+
+# Local backup archives
+*.tar.gz
